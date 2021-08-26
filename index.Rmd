@@ -1,0 +1,290 @@
+---
+title: "Practical Machine Learning Course Project"
+author: "Jeffrey Meyer"
+date: "8/26/2021"
+output: html_document
+bibliography: bibliography.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache=TRUE)
+
+library(sjstats)
+library(caret)
+library(dplyr)
+library(kableExtra)
+library(parallel)
+library(doParallel)
+library(ggplot2)
+
+```
+
+```{r readdata}
+#Create Testing and Training data sets
+Training <- read.csv("pml-training.csv", header=TRUE)
+Testing <- read.csv("pml-testing.csv", header = TRUE)
+```
+
+```{r preprare}
+#Count NAs for each column
+percNA <- data.frame(var=character(),
+                      perc=double())
+for(i in 1:ncol(Training)) {
+      percNA[i,1] <- colnames(Training)[i]
+      percNA[i,2] <- 
+            (sum(is.na(Training[,i]))+sum(Training[,i]=="", na.rm=TRUE)) / 
+            nrow(Training)
+}
+summary(percNA$perc)
+table(percNA$perc)
+
+
+#Select only variables with few/no NAs
+percNA <- percNA[ which(percNA$perc<.001), ]
+Training <- Training[,percNA$var]
+
+#Keep only necessary columns and Set factor variables
+cols <- c(2,8:60)
+Training <- Training[cols]
+Training$user_name <- as.factor(Training$user_name)
+Training$classe <- as.factor(Training$classe)
+
+#Split Training into train (training) and val (validation) sets
+set.seed(5959)
+inTrain <- createDataPartition(y=Training$classe, p=0.7, list=FALSE)
+train <- Training[inTrain,]
+val <- Training[-inTrain,]
+
+```
+Of the variables in the training dataset, only 60 have no missing values or empty strings, while 100 have about 98% missing values or empty strings each. In addition, the row number, three timestamp, and two window window variables are excluded. Therefore, only the remaining 54 variables with are included. Next, the training dataset is randomly split into a true training dataset (70%) and a validation dataset (30%).
+
+``` {r explore1, results="asis", message=FALSE, warning=FALSE}
+#Create analysis of variance summary table
+aovresults2 <- data.frame(var=character(),
+                         pvalue=character(),
+                         cohen90=character(),
+                         movement=character(),
+                         part=character())
+for(i in 2:53) {
+      aovresults2[i-1,1] <- colnames(train)[i]
+      fit <- aov(train[,i]~as.factor(classe), data=train)
+      temp <- effectsize::cohens_f(fit)
+      c90 <- paste0("(",sprintf("%.2f",temp$CI_low),",",
+                    sprintf("%.2f",temp$CI_high),")")
+      if(summary(fit)[[1]][1,5]<0.001) {
+            aovresults2[i-1,2] <- paste0(sprintf("%.3f",summary(fit)[[1]][1,5])," *")
+      } else {
+            aovresults2[i-1,2] <- sprintf("%.3f",summary(fit)[[1]][1,5])
+      }
+      if(temp$CI_low>0.1) {
+            aovresults2[i-1,3] <- paste0(c90," **")
+      } else { 
+            aovresults2[i-1,3] <- c90
+      }
+      aovresults2[i-1,4] <- temp$CI_low
+}
+
+#Classify movement and part
+for(i in 1:nrow(aovresults2)) {
+      if(grepl("roll",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Roll"
+      } else if(grepl("pitch",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Pitch"
+      } else if(grepl("yaw",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Yaw"
+      } else if(grepl("accel",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Accel"
+      } else if(grepl("gyros",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Gyros"
+      } else if(grepl("magnet",aovresults2[i,1])) {
+            aovresults2[i,4] <- "Magnet"
+      } 
+      if(grepl("belt",aovresults2[i,1])) {
+            aovresults2[i,5] <- "Belt"
+      } else if(grepl("_arm",aovresults2[i,1])) {
+            aovresults2[i,5] <- "Arm"
+      } else if(grepl("_forearm",aovresults2[i,1])) {
+            aovresults2[i,5] <- "Forearm"
+      } else if(grepl("dumbbell",aovresults2[i,1])) {
+            aovresults2[i,5] <- "Dumbbell"
+      } 
+}
+
+
+# Create second training data set with reduced number of variables
+aovkeep <- aovresults2[ which(aovresults2$cohenlow>0.1),1 ]
+trainsmall <- train[,c(aovkeep,"user_name","classe")]
+```
+## Data Exploration
+To begin data exploration, analysis of variance is used to determine which classes have significantly different means. For each run, the $p$ value is calculated and flagged if it is significant at the $p < 0.001$ level. However, because of such a large sample size, most variables are significant. Therefore, a 90% confidence interval for the Cohen's $f$ effect size is also calculated. @cohen2013statistical suggested a minimum of 0.1 for a small effect size. Using only these variables that pass this Choen's $f$ threshold, a second training data set with these 27 variables, along with $user\_name$ and $classe$ is created.
+
+## Modeling
+
+In total, three models are run twice, once with the full alotment of variables, and once with the reduced alotment of variables. The three models used are **Decision Trees**, **Random Forests**, and **Gradient Boosted Trees**. For each run, the accuracy is saved and stored in a table for easy comparison of the models.
+
+``` {r models1}
+#Create Dataframe to store accuracy results
+accDF <- data.frame(model=character(3), 
+                    fulltrain=character(3), smalltrain=character(3),
+                    fullval=character(3), fullvalCI=character(3), 
+                    fullvaloos=character(3), smallval=character(3),
+                    smallvalCI=character(3), smallvaloos=character(3))
+models <- c("Decision Tree", "Random Forest", "Gradient Boosted Trees")
+accDF[,1] <- models
+```
+
+```{r modelsDT}
+#Decision Tree Models
+##Set up 5-fold cross validation
+fitControl <- trainControl(method = "cv", number = 5, verboseIter=FALSE)
+##Run full model and save predicted confusion matrix
+fullRPART <- train(classe~.,method="rpart", data=train, trControl=fitControl)
+cmfdt <- confusionMatrix(data=predict(fullRPART, val), reference=val$classe)
+##Run small model and save predicted confusion matrix
+smallRPART <- train(classe~.,method="rpart", data=trainsmall, trControl=fitControl)
+cmsdt <- confusionMatrix(data=predict(smallRPART, val), reference=val$classe)
+```
+
+``` {r contolrfgbm}
+#Setup 5-fold cross validation control for RF and GBM models; allow parallel
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           allowParallel = TRUE)
+```
+
+``` {r modelsRF}
+#Random Forest Models
+##Run full model and save predicted confusion matrix
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fullRF <- train(classe~., method="rf",data=train,trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+cmfrf <- confusionMatrix(data=predict(fullRF, val), reference=val$classe)
+##Run small model and save predicted confusion matrix
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+smallRF <- train(classe~., method="rf",data=trainsmall,trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+cmsrf <- confusionMatrix(data=predict(smallRF, val), reference=val$classe)
+```
+
+``` {r modelsGBM}
+#Gradient Boosted Tree Models
+##Run full model and save predicted confusion matrix
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fullGBM <- train(classe~., method="gbm",data=train,trControl = fitControl,verbose=FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+cmfgbm <- confusionMatrix(data=predict(fullGBM, val), reference=val$classe)
+##Run small model and save predicted confusion matrix
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+smallGBM <- train(classe~., method="gbm",data=trainsmall,
+                  trControl = fitControl,verbose=FALSE)
+stopCluster(cluster)
+registerDoSEQ()
+cmsgbm <- confusionMatrix(data=predict(smallGBM, val), reference=val$classe)
+```
+### Model Selection
+
+The full **Random Forest** model provided the best accuracy in both the training set (`r sprintf("%.3f",max(fullRF$results["Accuracy"]))`) and in the validation set (`r sprintf("%.3f",cmfrf$overall["Accuracy"])`). Looking at the other methods, both **Decision Tree** models performed about equally on the validation set, while the **Gradient Boosted Tree** full model performed considerably better than small model on the validation set. While the full **Random Forest** model performed better than the small model, the difference was small. However, the full **Random Forest** model using all 53 predictors is selected as the best model.
+``` {r accuracytable, cache=FALSE}
+#Fill in accuracy table
+##Full Model Decision Tree Accuracy
+accDF[1,2] <- sprintf("%.3f",max(fullRPART$results["Accuracy"]))
+accDF[1,4] <- sprintf("%.3f",cmfdt$overall["Accuracy"])
+accDF[1,5] <- paste0("(", sprintf("%.3f",cmfdt$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmfdt$overall["AccuracyUpper"]),")")
+accDF[1,6] <- sprintf("%.3f",1-cmfdt$overall["Accuracy"])
+##Small Model Decision Tree Accuracy
+accDF[1,3] <- sprintf("%.3f",max(smallRPART$results["Accuracy"]))
+accDF[1,7] <- sprintf("%.3f",cmsdt$overall["Accuracy"])
+accDF[1,8] <- paste0("(", sprintf("%.3f",cmsdt$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmsdt$overall["AccuracyUpper"]),")")
+accDF[1,9] <- sprintf("%.3f",1-cmsdt$overall["Accuracy"])
+##Full Model Random Forest Accuracy
+accDF[2,2] <- sprintf("%.3f",max(fullRF$results["Accuracy"]))
+accDF[2,4] <- sprintf("%.3f",cmfrf$overall["Accuracy"])
+accDF[2,5] <- paste0("(", sprintf("%.3f",cmfrf$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmfrf$overall["AccuracyUpper"]),")")
+accDF[2,6] <- sprintf("%.3f",1-cmfrf$overall["Accuracy"])
+##Small Model Random Forest Accuracy
+accDF[2,3] <- sprintf("%.3f",max(smallRF$results["Accuracy"]))
+accDF[2,7] <- sprintf("%.3f",cmsrf$overall["Accuracy"])
+accDF[2,8] <- paste0("(", sprintf("%.3f",cmsrf$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmsrf$overall["AccuracyUpper"]),")")
+accDF[2,9] <- sprintf("%.3f",1-cmsrf$overall["Accuracy"])
+##Full Model Gradient Boosted Tree Accuracy
+accDF[3,2] <- sprintf("%.3f",max(fullGBM$results["Accuracy"]))
+accDF[3,4] <- sprintf("%.3f",cmfgbm$overall["Accuracy"])
+accDF[3,5] <- paste0("(", sprintf("%.3f",cmfgbm$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmfgbm$overall["AccuracyUpper"]),")")
+accDF[3,6] <- sprintf("%.3f",1-cmfgbm$overall["Accuracy"])
+##Small Model Gradient Boosted Tree Accuracy
+accDF[3,3] <- sprintf("%.3f",max(smallGBM$results["Accuracy"]))
+accDF[3,7] <- sprintf("%.3f",cmsgbm$overall["Accuracy"])
+accDF[3,8] <- paste0("(", sprintf("%.3f",cmsgbm$overall["AccuracyLower"]),
+                     ",", sprintf("%.3f",cmsgbm$overall["AccuracyUpper"]),")")
+accDF[3,9] <- sprintf("%.3f",1-cmsgbm$overall["Accuracy"])
+##Print Table
+accDF %>% 
+      kbl(col.names=c("Model", "Accuracy", "Accuracy", "Accuracy",
+                      "Accuracy 95% CI", "OOS Error", "Accuracy",
+                      "Accuracy 95% CI", "OOS Error"),
+          escape=FALSE, align="c") %>% 
+      kable_styling(full_width=FALSE, font_size=10) %>%
+      column_spec(c(2,4:6), background="aliceblue") %>%
+      column_spec(c(3,7:9), background="lemonchiffon") %>%
+      add_header_above(c(" " = 1, "Full Model" = 1, "Small Model" = 1, 
+                         "Full Model" = 3, "Small Model" = 3)) %>%
+      add_header_above(c(" " = 1, "Training Set" = 2, "Validation Set" = 6))
+      
+```
+### Variable Importance
+
+To help understand which variables have the most predictive power, the variable importance is examined. The figure below shows the scaled variable importance values for the top 20 predictors. The variable with by far the most predictive power is $roll\_belt$. Interestingly, of the top 20 variables, eight were measured on the belt, seven were measured on the dumbbell, four were measured on the forearm, and only one was measured on the arm.
+
+``` {r varimp}
+imp <- varImp(fullRF)$importance
+imp$movement[6:57] <-  aovresults2$movement
+imp$movement[1:5] <- "Name"
+imp$part[6:57] <- aovresults2$part
+imp$part[1:5] <- "Name"
+imp$varnames <- rownames(imp)
+imp <- imp %>% arrange(desc(Overall)) %>% slice(1:20)
+g <- ggplot(imp, aes(x=reorder(varnames, Overall), 
+                     y=Overall, color=as.factor(part)))
+g + geom_point() + 
+      geom_segment(aes(x=varnames, xend=varnames, y=0, yend=Overall)) + 
+      labs(y="Variable Importance", x="Variable", title="Variable Importance") +
+      scale_color_discrete(name="Part") + 
+      coord_flip()
+
+```
+
+## Precictions on the Test Set
+
+Using the full **Random Forest** model, the Test set of 20 cases are predicted as follows.
+
+``` {r prediction}
+pred <- predict(fullRF, Testing)
+print(pred)
+```
+
+## Appendix
+
+### Table A1: Analysis of Variance Results for Each Variable
+``` {r appendix1}
+
+aovresults2[,1:3] %>% 
+      kbl(col.names=c("Variable", "p-value", "Cohen's f<br/>90% CI"),
+          escape=FALSE) %>% 
+      kable_styling(full_width=FALSE) %>%
+      add_footnote(c("* p-value < 0.001", "** Cohen's f 90% CI Lower Bound > 0.1"),
+                   notation="none")
+
+```
+## References
